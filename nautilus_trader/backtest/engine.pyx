@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import heapq
+import os
 import pickle
 import uuid
 from collections import deque
@@ -164,15 +165,18 @@ from nautilus_trader.model.data cimport compute_bar_quarter_sizes
 from nautilus_trader.model.events.order cimport OrderAccepted
 from nautilus_trader.model.events.order cimport OrderCanceled
 from nautilus_trader.model.events.order cimport OrderCancelRejected
+from nautilus_trader.model.events.order cimport OrderEvent
 from nautilus_trader.model.events.order cimport OrderExpired
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.events.order cimport OrderModifyRejected
 from nautilus_trader.model.events.order cimport OrderRejected
 from nautilus_trader.model.events.order cimport OrderTriggered
 from nautilus_trader.model.events.order cimport OrderUpdated
+from nautilus_trader.model.functions cimport account_type_to_pyo3
 from nautilus_trader.model.functions cimport account_type_to_str
 from nautilus_trader.model.functions cimport aggressor_side_to_str
 from nautilus_trader.model.functions cimport book_type_to_str
+from nautilus_trader.model.functions cimport market_status_action_to_str
 from nautilus_trader.model.functions cimport oms_type_to_str
 from nautilus_trader.model.functions cimport order_type_to_str
 from nautilus_trader.model.functions cimport time_in_force_to_str
@@ -533,6 +537,7 @@ cdef class BacktestEngine:
         frozen_account: bool = False,
         price_protection_points = None,
         settlement_prices: dict[InstrumentId, float] | None = None,
+        matching_engine: str | None = None,
     ) -> None:
         """
         Add a `SimulatedExchange` with the given parameters to the backtest engine.
@@ -624,13 +629,21 @@ cdef class BacktestEngine:
             Map of instrument ID to settlement price for expiring instruments.
             For futures, positions close at this price instead of market.
             For options, the option leg settles at this price.
+        matching_engine : str {'cython', 'rust'}, optional
+            The order matching engine implementation to use for the venue.
+            If ``None`` then the `NAUTILUS_BACKTEST_MATCHING_ENGINE` env var is
+            honoured, falling back to 'cython'.
 
         Raises
         ------
         ValueError
             If `venue` is already registered with the engine.
+        ValueError
+            If `matching_engine` is not one of 'cython' or 'rust'.
 
         """
+        matching_engine = resolve_matching_engine(matching_engine)
+
         if modules is None:
             modules = []
 
@@ -691,6 +704,7 @@ cdef class BacktestEngine:
             queue_position=queue_position,
             price_protection_points=price_protection_points,
             settlement_prices=settlement_prices,
+            matching_engine=matching_engine,
         )
 
         self._venues[venue] = exchange
@@ -1890,7 +1904,7 @@ cdef class BacktestEngine:
     cdef void _process_and_settle_venues(self, uint64_t ts_now):
         cdef SimulatedExchange exchange
         cdef SimulationModule module
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         cdef bint has_activity
 
         # Advance venue clocks so modules and event generators see the
@@ -2796,6 +2810,10 @@ cdef class SimulatedExchange:
         Map of instrument ID to settlement price for expiring instruments.
         For futures, positions close at this price instead of market.
         For options, the option leg settles at this price.
+    matching_engine : str, default 'cython'
+        The order matching engine implementation to use ('cython' or 'rust').
+        If 'rust' then the `nautilus_pyo3.OrderMatchingEngine` is driven via the
+        `RustOrderMatchingEngine` bridge.
 
     Raises
     ------
@@ -2850,6 +2868,7 @@ cdef class SimulatedExchange:
         bint queue_position = False,
         price_protection_points=None,
         settlement_prices: dict[InstrumentId, float] | None = None,
+        str matching_engine = "cython",
     ) -> None:
         Condition.not_empty(starting_balances, "starting_balances")
         Condition.list_type(starting_balances, Money, "starting_balances")
@@ -2866,6 +2885,7 @@ cdef class SimulatedExchange:
 
         self.id = venue
         self.settlement_prices = settlement_prices or {}
+        self.matching_engine = resolve_matching_engine(matching_engine)
         self.oms_type = oms_type
         self._log.info(f"OmsType={oms_type_to_str(oms_type)}")
         self.book_type = book_type
@@ -2924,7 +2944,7 @@ cdef class SimulatedExchange:
 
         # Markets
         self.instruments: dict[InstrumentId, Instrument] = {}
-        self._matching_engines: dict[InstrumentId, OrderMatchingEngine] = {}
+        self._matching_engines: dict[InstrumentId, MatchingEngineBase] = {}
 
         self._has_next_instrument_expiration = False
         self._next_instrument_expiration_ns = 0
@@ -2978,7 +2998,7 @@ cdef class SimulatedExchange:
 
         self.fill_model = fill_model
 
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         for matching_engine in self._matching_engines.values():
             matching_engine.set_fill_model(fill_model)
             self._log.info(
@@ -3040,7 +3060,8 @@ cdef class SimulatedExchange:
 
         self.instruments[instrument.id] = instrument
 
-        cdef OrderMatchingEngine matching_engine = OrderMatchingEngine(
+        matching_engine_cls = RustOrderMatchingEngine if self.matching_engine == "rust" else OrderMatchingEngine
+        cdef MatchingEngineBase matching_engine = matching_engine_cls(
             instrument=instrument,
             raw_id=len(self.instruments),
             fill_model=self.fill_model,
@@ -3093,7 +3114,7 @@ cdef class SimulatedExchange:
         """
         Condition.not_none(instrument_id, "instrument_id")
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(instrument_id)
         if matching_engine is None:
             return None
 
@@ -3115,7 +3136,7 @@ cdef class SimulatedExchange:
         """
         Condition.not_none(instrument_id, "instrument_id")
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(instrument_id)
         if matching_engine is None:
             return None
 
@@ -3137,13 +3158,13 @@ cdef class SimulatedExchange:
         """
         Condition.not_none(instrument_id, "instrument_id")
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(instrument_id)
         if matching_engine is None:
             return None
 
         return matching_engine.get_book()
 
-    cpdef OrderMatchingEngine get_matching_engine(self, InstrumentId instrument_id):
+    cpdef MatchingEngineBase get_matching_engine(self, InstrumentId instrument_id):
         """
         Return the matching engine for the given instrument ID (if found).
 
@@ -3165,7 +3186,7 @@ cdef class SimulatedExchange:
 
         Returns
         -------
-        dict[InstrumentId, OrderMatchingEngine]
+        dict[InstrumentId, MatchingEngineBase]
 
         """
         return self._matching_engines.copy()
@@ -3180,7 +3201,7 @@ cdef class SimulatedExchange:
 
         """
         cdef dict books = {}
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         for matching_engine in self._matching_engines.values():
             books[matching_engine.instrument.id] = matching_engine.get_book()
 
@@ -3200,7 +3221,7 @@ cdef class SimulatedExchange:
         list[Order]
 
         """
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         if instrument_id is not None:
             matching_engine = self._matching_engines.get(instrument_id)
             if matching_engine is None:
@@ -3228,7 +3249,7 @@ cdef class SimulatedExchange:
         list[Order]
 
         """
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         if instrument_id is not None:
             matching_engine = self._matching_engines.get(instrument_id)
             if matching_engine is None:
@@ -3256,7 +3277,7 @@ cdef class SimulatedExchange:
         list[Order]
 
         """
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         if instrument_id is not None:
             matching_engine = self._matching_engines.get(instrument_id)
             if matching_engine is None:
@@ -3345,7 +3366,7 @@ cdef class SimulatedExchange:
         """
         Condition.not_none(instrument, "instrument")
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(instrument.id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(instrument.id)
         if matching_engine is None:
             self.add_instrument(instrument)
             return
@@ -3415,7 +3436,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(delta)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(delta.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(delta.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(delta.instrument_id)
             if instrument is None:
@@ -3442,7 +3463,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(deltas)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(deltas.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(deltas.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(deltas.instrument_id)
             if instrument is None:
@@ -3469,7 +3490,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(depth)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(depth.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(depth.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(depth.instrument_id)
             if instrument is None:
@@ -3498,7 +3519,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(tick)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(tick.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(tick.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(tick.instrument_id)
             if instrument is None:
@@ -3527,7 +3548,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(tick)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(tick.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(tick.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(tick.instrument_id)
             if instrument is None:
@@ -3556,7 +3577,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(bar)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(bar.bar_type.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(bar.bar_type.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(bar.bar_type.instrument_id)
             if instrument is None:
@@ -3583,7 +3604,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(data)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(data.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(data.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(data.instrument_id)
             if instrument is None:
@@ -3610,7 +3631,7 @@ cdef class SimulatedExchange:
         for module in self.modules:
             module.pre_process(close)
 
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(close.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(close.instrument_id)
         if matching_engine is None:
             instrument = self.cache.instrument(close.instrument_id)
             if instrument is None:
@@ -3670,7 +3691,7 @@ cdef class SimulatedExchange:
         cdef uint64_t expiration_ns
         cdef bint found = False
 
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         for matching_engine in self._matching_engines.values():
             if not matching_engine._instrument_has_expiration:
                 continue
@@ -3694,7 +3715,7 @@ cdef class SimulatedExchange:
     cpdef void _process_instrument_expiration_time_event(self, TimeEvent event):
         self._process_instrument_expirations(event.ts_event)
 
-    cdef void _update_next_instrument_expiration(self, OrderMatchingEngine matching_engine):
+    cdef void _update_next_instrument_expiration(self, MatchingEngineBase matching_engine):
         cdef uint64_t expiration_ns
         if matching_engine._instrument_has_expiration and not matching_engine._expiration_processed:
             expiration_ns = matching_engine.instrument.expiration_ns
@@ -3703,7 +3724,7 @@ cdef class SimulatedExchange:
                     self._has_next_instrument_expiration = True
                     self._next_instrument_expiration_ns = expiration_ns
 
-    cdef void _set_instrument_expiration_timer(self, OrderMatchingEngine matching_engine):
+    cdef void _set_instrument_expiration_timer(self, MatchingEngineBase matching_engine):
         if not matching_engine._instrument_has_expiration or matching_engine._expiration_processed:
             return
 
@@ -3725,7 +3746,7 @@ cdef class SimulatedExchange:
         )
 
     cdef void _set_instrument_expiration_timers(self):
-        cdef OrderMatchingEngine matching_engine
+        cdef MatchingEngineBase matching_engine
         for matching_engine in self._matching_engines.values():
             self._set_instrument_expiration_timer(matching_engine)
 
@@ -3764,7 +3785,7 @@ cdef class SimulatedExchange:
 
     cdef void _process_trading_command(self, TradingCommand command):
         cdef Instrument instrument
-        cdef OrderMatchingEngine matching_engine = self._matching_engines.get(command.instrument_id)
+        cdef MatchingEngineBase matching_engine = self._matching_engines.get(command.instrument_id)
         if matching_engine is None:
             raise RuntimeError(f"Cannot process command: no matching engine for {command.instrument_id}")
 
@@ -3921,7 +3942,832 @@ cdef class SimulatedExchange:
                 account.set_margin_model(self.margin_model)
 
 
-cdef class OrderMatchingEngine:
+
+MATCHING_ENGINE_ENV_VAR = "NAUTILUS_BACKTEST_MATCHING_ENGINE"
+VALID_MATCHING_ENGINES = ("cython", "rust")
+
+
+def resolve_matching_engine(matching_engine: str | None) -> str:
+    """
+    Resolve the matching engine implementation selector.
+
+    Resolution order is the explicit value, then the `NAUTILUS_BACKTEST_MATCHING_ENGINE`
+    environment variable, then the default 'cython'.
+
+    Parameters
+    ----------
+    matching_engine : str, optional
+        The explicit matching engine selector ('cython' or 'rust').
+
+    Returns
+    -------
+    str
+
+    Raises
+    ------
+    ValueError
+        If the resolved value is not one of 'cython' or 'rust'.
+
+    """
+    if matching_engine is None:
+        matching_engine = os.environ.get(MATCHING_ENGINE_ENV_VAR) or "cython"
+
+    Condition.type(matching_engine, str, "matching_engine")
+    matching_engine = matching_engine.strip().lower()
+
+    if matching_engine not in VALID_MATCHING_ENGINES:
+        raise ValueError(
+            f"Invalid `matching_engine` '{matching_engine}', "
+            f"was not one of {VALID_MATCHING_ENGINES}",
+        )
+
+    return matching_engine
+
+
+cdef class MatchingEngineBase:
+    """
+    The abstract base class for all order matching engine implementations used by
+    the `SimulatedExchange`.
+
+    Warnings
+    --------
+    This class should not be used directly, but through a concrete subclass.
+
+    """
+
+    cpdef void reset(self):
+        raise NotImplementedError("method `reset` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void set_fill_model(self, FillModel fill_model):
+        raise NotImplementedError("method `set_fill_model` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void update_instrument(self, Instrument instrument):
+        raise NotImplementedError("method `update_instrument` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef Price best_bid_price(self):
+        raise NotImplementedError("method `best_bid_price` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef Price best_ask_price(self):
+        raise NotImplementedError("method `best_ask_price` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef OrderBook get_book(self):
+        raise NotImplementedError("method `get_book` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef list[Order] get_open_orders(self):
+        raise NotImplementedError("method `get_open_orders` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef list[Order] get_open_bid_orders(self):
+        raise NotImplementedError("method `get_open_bid_orders` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef list[Order] get_open_ask_orders(self):
+        raise NotImplementedError("method `get_open_ask_orders` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef bint order_exists(self, ClientOrderId client_order_id):
+        raise NotImplementedError("method `order_exists` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_order_book_delta(self, OrderBookDelta delta):
+        raise NotImplementedError("method `process_order_book_delta` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_order_book_deltas(self, OrderBookDeltas deltas):
+        raise NotImplementedError("method `process_order_book_deltas` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_order_book_depth10(self, OrderBookDepth10 depth):
+        raise NotImplementedError("method `process_order_book_depth10` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_quote_tick(self, QuoteTick tick):
+        raise NotImplementedError("method `process_quote_tick` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_trade_tick(self, TradeTick tick):
+        raise NotImplementedError("method `process_trade_tick` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_bar(self, Bar bar):
+        raise NotImplementedError("method `process_bar` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_status(self, MarketStatusAction status):
+        raise NotImplementedError("method `process_status` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_instrument_close(self, InstrumentClose close):
+        raise NotImplementedError("method `process_instrument_close` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void check_instrument_expiration(self, uint64_t timestamp_ns):
+        raise NotImplementedError("method `check_instrument_expiration` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_order(self, Order order, AccountId account_id):
+        raise NotImplementedError("method `process_order` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_modify(self, ModifyOrder command, AccountId account_id):
+        raise NotImplementedError("method `process_modify` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_cancel(self, CancelOrder command, AccountId account_id):
+        raise NotImplementedError("method `process_cancel` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_cancel_all(self, CancelAllOrders command, AccountId account_id):
+        raise NotImplementedError("method `process_cancel_all` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void process_batch_cancel(self, BatchCancelOrders command, AccountId account_id):
+        raise NotImplementedError("method `process_batch_cancel` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void iterate(self, uint64_t timestamp_ns, AggressorSide aggressor_side = AggressorSide.NO_AGGRESSOR):
+        raise NotImplementedError("method `iterate` must be implemented in the subclass")  # pragma: no cover
+
+
+# Maps pyo3 order event `type` strings to the legacy Cython event classes
+_ORDER_EVENT_CLASSES = {
+    "OrderAccepted": OrderAccepted,
+    "OrderRejected": OrderRejected,
+    "OrderCanceled": OrderCanceled,
+    "OrderExpired": OrderExpired,
+    "OrderTriggered": OrderTriggered,
+    "OrderUpdated": OrderUpdated,
+    "OrderFilled": OrderFilled,
+    "OrderModifyRejected": OrderModifyRejected,
+    "OrderCancelRejected": OrderCancelRejected,
+}
+
+
+cdef class RustOrderMatchingEngine(MatchingEngineBase):
+    """
+    Provides a bridge from the `SimulatedExchange` to the Rust `OrderMatchingEngine`
+    exposed through `nautilus_pyo3`.
+
+    Every call sets the Rust engines internal clock from the exchange clock, converts
+    the legacy Cython inputs to their pyo3 equivalents, delegates to the Rust engine,
+    then drains all order events the Rust engine emitted and dispatches them to the
+    `ExecutionEngine` through the message bus (exactly as the Cython engine does).
+
+    Parameters
+    ----------
+    instrument : Instrument
+        The market instrument for the matching engine.
+    raw_id : uint32_t
+        The raw integer ID for the instrument.
+    fill_model : FillModel
+        The fill model for the matching engine.
+    fee_model : FeeModel
+        The fee model for the matching engine.
+    book_type : BookType
+        The order book type for the matching engine.
+    oms_type : OmsType {``HEDGING``, ``NETTING``}
+        The order management system type for the matching engine.
+    account_type : AccountType
+        The account type for the matching engine.
+    msgbus : MessageBus
+        The message bus for the matching engine.
+    cache : CacheFacade
+        The read-only cache for the matching engine.
+    clock : TestClock
+        The clock for the matching engine.
+
+    Notes
+    -----
+    Settlement prices are not supported by the Rust engine and are ignored (a
+    warning is logged). The `get_book` query returns a Cython `OrderBook` mirror
+    which is updated from book/quote/trade data and from the Rust engines top-of-book
+    after bar processing.
+
+    """
+
+    def __init__(
+        self,
+        Instrument instrument not None,
+        uint32_t raw_id,
+        FillModel fill_model not None,
+        FeeModel fee_model not None,
+        BookType book_type,
+        OmsType oms_type,
+        AccountType account_type,
+        MessageBus msgbus not None,
+        CacheFacade cache not None,
+        TestClock clock not None,
+        bint reject_stop_orders = True,
+        bint support_gtd_orders = True,
+        bint support_contingent_orders = True,
+        bint oto_full_trigger = False,
+        bint use_position_ids = True,
+        bint use_random_ids = False,
+        bint use_reduce_only = True,
+        bint use_market_order_acks = False,
+        bint bar_execution = True,
+        bint bar_adaptive_high_low_ordering = False,
+        bint trade_execution = True,
+        bint liquidity_consumption = False,
+        bint queue_position = False,
+        price_protection_points=None,
+        settlement_prices: dict[InstrumentId, float] | None = None,
+    ) -> None:
+        if not hasattr(nautilus_pyo3, "OrderMatchingEngine"):
+            raise RuntimeError(
+                "`nautilus_pyo3.OrderMatchingEngine` is not available in this build, "
+                "use `matching_engine='cython'` or rebuild with the PyO3 wrapper",
+            )
+
+        self._clock = clock
+        self._log = Logger(name=f"{type(self).__name__}({instrument.id.venue})")
+        self.msgbus = msgbus
+        self.cache = cache
+
+        self.venue = instrument.id.venue
+        self.instrument = instrument
+        self.raw_id = raw_id
+        self.book_type = book_type
+        self.oms_type = oms_type
+        self.account_type = account_type
+
+        self._instrument_has_expiration = instrument.instrument_class in ENGINE_EXPIRING_INSTRUMENT_CLASSES
+        self._expiration_processed = False
+        self._set_expiration_ns(instrument)
+
+        if settlement_prices:
+            self._log.warning(
+                "Settlement prices are not supported by the Rust matching engine and will be ignored",
+            )
+
+        self._fill_model = fill_model
+        self._fee_model = fee_model
+        self._book = OrderBook(
+            instrument_id=instrument.id,
+            book_type=book_type,
+        )
+        self._pyo3_orders = {}
+
+        self._config = nautilus_pyo3.OrderMatchingEngineConfig(
+            bar_execution=bar_execution,
+            bar_adaptive_high_low_ordering=bar_adaptive_high_low_ordering,
+            trade_execution=trade_execution,
+            liquidity_consumption=liquidity_consumption,
+            reject_stop_orders=reject_stop_orders,
+            support_gtd_orders=support_gtd_orders,
+            support_contingent_orders=support_contingent_orders,
+            use_position_ids=use_position_ids,
+            use_random_ids=use_random_ids,
+            use_reduce_only=use_reduce_only,
+            use_market_order_acks=use_market_order_acks,
+            queue_position=queue_position,
+            oto_full_trigger=oto_full_trigger,
+            price_protection_points=price_protection_points if price_protection_points is not None else 0,
+        )
+        self._pyo3_instrument = instrument_to_pyo3(instrument)
+        self._engine = nautilus_pyo3.OrderMatchingEngine(
+            instrument=self._pyo3_instrument,
+            raw_id=raw_id,
+            fill_model=fill_model,
+            fee_model=fee_model,
+            book_type=nautilus_pyo3.BookType(book_type_to_str(book_type)),
+            oms_type=nautilus_pyo3.OmsType(oms_type_to_str(oms_type)),
+            account_type=account_type_to_pyo3(account_type),
+            config=self._config,
+            ts_init_ns=clock.timestamp_ns(),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}("
+            f"venue={self.venue.value}, "
+            f"instrument_id={self.instrument.id.value}, "
+            f"raw_id={self.raw_id})"
+        )
+
+    cdef void _set_expiration_ns(self, Instrument instrument):
+        cdef object expiration_ns = getattr(instrument, "expiration_ns", None)
+        if self._instrument_has_expiration and expiration_ns:
+            self._has_expiration_ns = True
+            self._expiration_ns = expiration_ns
+        else:
+            self._has_expiration_ns = False
+            self._expiration_ns = 0
+
+    cdef void _set_time(self):
+        self._engine.set_time(self._clock.timestamp_ns())
+
+    cdef void _drain_events(self):
+        cdef list pyo3_events = self._engine.drain_events()
+        cdef dict values
+        cdef str event_type
+        for pyo3_event in pyo3_events:
+            values = pyo3_event.to_dict()
+            event_type = values["type"]
+            event_cls = _ORDER_EVENT_CLASSES.get(event_type)
+            if event_cls is None:
+                raise RuntimeError(f"Unsupported order event type '{event_type}' from Rust matching engine")
+
+            if event_type == "OrderFilled" and values.get("commission") is None:
+                values["commission"] = str(Money(0, self.instrument.quote_currency))
+
+            event = event_cls.from_dict(values)
+            self.msgbus.send(endpoint="ExecEngine.process", msg=event)
+
+    cdef void _sync_top_of_book(self, uint64_t ts_event):
+        # Mirror the Rust engines top-of-book into the Cython book after bar processing
+        cdef Price bid = self.best_bid_price()
+        cdef Price ask = self.best_ask_price()
+        if bid is None or ask is None:
+            return
+
+        cdef Quantity size = self.instrument.size_increment
+        cdef QuoteTick tick = QuoteTick(
+            self.instrument.id,
+            bid,
+            ask,
+            size,
+            size,
+            ts_event,
+            ts_event,
+        )
+        self._book.update_quote_tick(tick)
+
+    cdef object _order_to_pyo3(self, Order order):
+        cdef object pyo3_order = self._pyo3_orders.get(order.client_order_id)
+        if pyo3_order is not None:
+            return pyo3_order
+
+        pyo3_order_cls = getattr(nautilus_pyo3, type(order).__name__)
+        pyo3_order = pyo3_order_cls.from_dict(order.to_dict())
+
+        # Replay the order's event history (after initialization) so the pyo3
+        # order state (e.g. `SUBMITTED`) matches the legacy Cython order state.
+        cdef list events = order.events
+        for event in events[1:]:
+            pyo3_order.apply(order_event_to_pyo3(event))
+
+        self._pyo3_orders[order.client_order_id] = pyo3_order
+        return pyo3_order
+
+    cdef object _command_to_pyo3(self, TradingCommand command):
+        pyo3_command_cls = getattr(nautilus_pyo3, type(command).__name__)
+        return pyo3_command_cls.from_dict(type(command).to_dict(command))
+
+    cdef list _orders_from_pyo3(self, list pyo3_orders):
+        cdef list orders = []
+        cdef Order order
+        for pyo3_order in pyo3_orders:
+            order = self.cache.order(ClientOrderId(pyo3_order.client_order_id.value))
+            if order is not None:
+                orders.append(order)
+
+        return orders
+
+    cpdef void reset(self):
+        """
+        Reset the matching engine.
+
+        All stateful fields are reset to their initial value.
+
+        """
+        self._log.debug(f"Resetting {self.instrument.id}")
+
+        self._engine.reset()
+        self._engine.drain_events()
+        self._book.reset()
+        self._pyo3_orders.clear()
+        self._expiration_processed = False
+
+        self._log.info(f"Reset {self.instrument.id}")
+
+    cpdef void set_fill_model(self, FillModel fill_model):
+        """
+        Set the fill model to the given model.
+
+        Parameters
+        ----------
+        fill_model : FillModel
+            The fill model to set.
+
+        """
+        Condition.not_none(fill_model, "fill_model")
+
+        self._fill_model = fill_model
+        self._engine.set_fill_model(fill_model)
+
+    cpdef void update_instrument(self, Instrument instrument):
+        """
+        Update the matching engines current instrument definition with the given instrument.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument definition to update.
+
+        """
+        Condition.not_none(instrument, "instrument")
+        Condition.equal(instrument.id, self.instrument.id, "instrument.id", "self.instrument.id")
+
+        self.instrument = instrument
+        self._instrument_has_expiration = instrument.instrument_class in ENGINE_EXPIRING_INSTRUMENT_CLASSES
+        self._set_expiration_ns(instrument)
+        self._pyo3_instrument = instrument_to_pyo3(instrument)
+        self._set_time()
+        self._engine.update_instrument(self._pyo3_instrument)
+        self._drain_events()
+
+# -- QUERIES --------------------------------------------------------------------------------------
+
+    cpdef Price best_bid_price(self):
+        """
+        Return the best bid price for the given instrument ID (if found).
+
+        Returns
+        -------
+        Price or ``None``
+
+        """
+        pyo3_price = self._engine.best_bid_price()
+        if pyo3_price is None:
+            return None
+
+        return Price.from_raw_c(pyo3_price.raw, pyo3_price.precision)
+
+    cpdef Price best_ask_price(self):
+        """
+        Return the best ask price for the given instrument ID (if found).
+
+        Returns
+        -------
+        Price or ``None``
+
+        """
+        pyo3_price = self._engine.best_ask_price()
+        if pyo3_price is None:
+            return None
+
+        return Price.from_raw_c(pyo3_price.raw, pyo3_price.precision)
+
+    cpdef OrderBook get_book(self):
+        """
+        Return the legacy order book mirror for the Rust engines market.
+
+        Returns
+        -------
+        OrderBook
+
+        """
+        return self._book
+
+    cpdef list[Order] get_open_orders(self):
+        """
+        Return the open orders in the matching engine.
+
+        Returns
+        -------
+        list[Order]
+
+        """
+        return self._orders_from_pyo3(self._engine.get_open_orders())
+
+    cpdef list[Order] get_open_bid_orders(self):
+        """
+        Return the open bid orders in the matching engine.
+
+        Returns
+        -------
+        list[Order]
+
+        """
+        return self._orders_from_pyo3(self._engine.get_open_bid_orders())
+
+    cpdef list[Order] get_open_ask_orders(self):
+        """
+        Return the open ask orders at the matching engine.
+
+        Returns
+        -------
+        list[Order]
+
+        """
+        return self._orders_from_pyo3(self._engine.get_open_ask_orders())
+
+    cpdef bint order_exists(self, ClientOrderId client_order_id):
+        return self._engine.order_exists(nautilus_pyo3.ClientOrderId(client_order_id.value))
+
+# -- DATA PROCESSING ------------------------------------------------------------------------------
+
+    cpdef void process_order_book_delta(self, OrderBookDelta delta):
+        """
+        Process the exchanges market for the given order book delta.
+
+        Parameters
+        ----------
+        delta : OrderBookDelta
+            The order book delta to process.
+
+        """
+        Condition.not_none(delta, "delta")
+
+        self._book.apply_delta(delta)
+        self._set_time()
+        self._engine.process_order_book_delta(OrderBookDelta.to_pyo3_list([delta])[0])
+        self._drain_events()
+
+    cpdef void process_order_book_deltas(self, OrderBookDeltas deltas):
+        """
+        Process the exchanges market for the given order book deltas.
+
+        Parameters
+        ----------
+        deltas : OrderBookDeltas
+            The order book deltas to process.
+
+        """
+        Condition.not_none(deltas, "deltas")
+
+        self._book.apply_deltas(deltas)
+        self._set_time()
+        self._engine.process_order_book_deltas(deltas.to_pyo3())
+        self._drain_events()
+
+    cpdef void process_order_book_depth10(self, OrderBookDepth10 depth):
+        """
+        Process the exchanges market for the given order book depth.
+
+        Parameters
+        ----------
+        depth : OrderBookDepth10
+            The order book depth to process.
+
+        """
+        Condition.not_none(depth, "depth")
+
+        self._book.apply_depth(depth)
+        self._set_time()
+        self._engine.process_order_book_depth10(nautilus_pyo3.OrderBookDepth10.from_dict(depth.to_dict()))
+        self._drain_events()
+
+    cpdef void process_quote_tick(self, QuoteTick tick):
+        """
+        Process the exchanges market for the given quote tick.
+
+        Parameters
+        ----------
+        tick : QuoteTick
+            The tick to process.
+
+        """
+        Condition.not_none(tick, "tick")
+
+        if self.book_type == BookType.L1_MBP:
+            self._book.update_quote_tick(tick)
+
+        self._set_time()
+        self._engine.process_quote_tick(tick.to_pyo3())
+        self._drain_events()
+
+    cpdef void process_trade_tick(self, TradeTick tick):
+        """
+        Process the exchanges market for the given trade tick.
+
+        Parameters
+        ----------
+        tick : TradeTick
+            The tick to process.
+
+        """
+        Condition.not_none(tick, "tick")
+
+        if self.book_type == BookType.L1_MBP:
+            self._book.update_trade_tick(tick)
+
+        self._set_time()
+        self._engine.process_trade_tick(tick.to_pyo3())
+        self._drain_events()
+
+    cpdef void process_bar(self, Bar bar):
+        """
+        Process the exchanges market for the given bar.
+
+        Parameters
+        ----------
+        bar : Bar
+            The bar to process.
+
+        """
+        Condition.not_none(bar, "bar")
+
+        self._set_time()
+        self._engine.process_bar(bar.to_pyo3())
+        self._drain_events()
+
+        if self.book_type == BookType.L1_MBP:
+            self._sync_top_of_book(bar.ts_init)
+
+    cpdef void process_status(self, MarketStatusAction status):
+        """
+        Process the exchange status.
+
+        Parameters
+        ----------
+        status : MarketStatusAction
+            The status action to process.
+
+        """
+        self._set_time()
+        self._engine.process_status(nautilus_pyo3.MarketStatusAction(market_status_action_to_str(status)))
+        self._drain_events()
+
+    cpdef void process_instrument_close(self, InstrumentClose close):
+        """
+        Process the instrument close.
+
+        Parameters
+        ----------
+        close : InstrumentClose
+            The close price to process.
+
+        """
+        Condition.not_none(close, "close")
+
+        self._set_time()
+        self._engine.process_instrument_close(close.to_pyo3())
+        self._drain_events()
+
+    cpdef void check_instrument_expiration(self, uint64_t timestamp_ns):
+        """
+        Check and process the instruments expiration at the given timestamp.
+
+        The Rust engine processes expiration itself as part of `iterate`, so this
+        simply iterates the engine at the given time.
+
+        Parameters
+        ----------
+        timestamp_ns : uint64_t
+            The current time to check expiration against.
+
+        """
+        if not self._instrument_has_expiration or self._expiration_processed:
+            return
+
+        self.iterate(timestamp_ns)
+
+# -- TRADING COMMANDS -----------------------------------------------------------------------------
+
+    cpdef void process_order(self, Order order, AccountId account_id):
+        """
+        Process the given order.
+
+        Parameters
+        ----------
+        order : Order
+            The order to process.
+        account_id : AccountId
+            The account ID for the order.
+
+        """
+        Condition.not_none(order, "order")
+        Condition.not_none(account_id, "account_id")
+
+        self._set_time()
+        self._engine.process_order(self._order_to_pyo3(order), nautilus_pyo3.AccountId(account_id.value))
+        self._drain_events()
+
+    cpdef void process_modify(self, ModifyOrder command, AccountId account_id):
+        """
+        Process the given modify order command.
+
+        Parameters
+        ----------
+        command : ModifyOrder
+            The command to process.
+        account_id : AccountId
+            The account ID for the command.
+
+        """
+        Condition.not_none(command, "command")
+        Condition.not_none(account_id, "account_id")
+
+        self._set_time()
+        self._engine.process_modify(self._command_to_pyo3(command), nautilus_pyo3.AccountId(account_id.value))
+        self._drain_events()
+
+    cpdef void process_cancel(self, CancelOrder command, AccountId account_id):
+        """
+        Process the given cancel order command.
+
+        Parameters
+        ----------
+        command : CancelOrder
+            The command to process.
+        account_id : AccountId
+            The account ID for the command.
+
+        """
+        Condition.not_none(command, "command")
+        Condition.not_none(account_id, "account_id")
+
+        self._set_time()
+        self._engine.process_cancel(self._command_to_pyo3(command), nautilus_pyo3.AccountId(account_id.value))
+        self._drain_events()
+
+    cpdef void process_cancel_all(self, CancelAllOrders command, AccountId account_id):
+        """
+        Process the given cancel all orders command.
+
+        Parameters
+        ----------
+        command : CancelAllOrders
+            The command to process.
+        account_id : AccountId
+            The account ID for the command.
+
+        """
+        Condition.not_none(command, "command")
+        Condition.not_none(account_id, "account_id")
+
+        self._set_time()
+        self._engine.process_cancel_all(self._command_to_pyo3(command), nautilus_pyo3.AccountId(account_id.value))
+        self._drain_events()
+
+    cpdef void process_batch_cancel(self, BatchCancelOrders command, AccountId account_id):
+        """
+        Process the given batch cancel orders command.
+
+        Parameters
+        ----------
+        command : BatchCancelOrders
+            The command to process.
+        account_id : AccountId
+            The account ID for the command.
+
+        """
+        Condition.not_none(command, "command")
+        Condition.not_none(account_id, "account_id")
+
+        self._set_time()
+        self._engine.process_batch_cancel(self._command_to_pyo3(command), nautilus_pyo3.AccountId(account_id.value))
+        self._drain_events()
+
+# -- ORDER PROCESSING -----------------------------------------------------------------------------
+
+    cpdef void iterate(self, uint64_t timestamp_ns, AggressorSide aggressor_side = AggressorSide.NO_AGGRESSOR):
+        """
+        Iterate the matching engine by processing the bid and ask order sides
+        and advancing time up to the given UNIX `timestamp_ns`.
+
+        Parameters
+        ----------
+        timestamp_ns : uint64_t
+            UNIX timestamp to advance the matching engine time to.
+        aggressor_side : AggressorSide, default ``NO_AGGRESSOR``
+            The aggressor side for trade execution processing.
+
+        """
+        self._set_time()
+        self._engine.iterate(timestamp_ns, nautilus_pyo3.AggressorSide(aggressor_side_to_str(aggressor_side)))
+        self._drain_events()
+
+        if self._has_expiration_ns and not self._expiration_processed and timestamp_ns >= self._expiration_ns:
+            self._expiration_processed = True
+
+        # Purge cached pyo3 orders for closed orders
+        cdef Order order
+        cdef list closed = []
+        for client_order_id in self._pyo3_orders:
+            order = self.cache.order(client_order_id)
+            if order is not None and order.is_closed_c():
+                closed.append(client_order_id)
+
+        for client_order_id in closed:
+            self._pyo3_orders.pop(client_order_id, None)
+
+
+cpdef object instrument_to_pyo3(Instrument instrument):
+    """
+    Return a pyo3 instrument converted from the given legacy Cython instrument.
+
+    Parameters
+    ----------
+    instrument : Instrument
+        The legacy Cython instrument to convert.
+
+    Returns
+    -------
+    nautilus_pyo3 instrument
+
+    """
+    Condition.not_none(instrument, "instrument")
+
+    pyo3_instrument_cls = getattr(nautilus_pyo3, type(instrument).__name__)
+    return pyo3_instrument_cls.from_dict(type(instrument).to_dict(instrument))
+
+
+cpdef object order_event_to_pyo3(OrderEvent event):
+    """
+    Return a pyo3 order event converted from the given legacy Cython order event.
+
+    Parameters
+    ----------
+    event : OrderEvent
+        The legacy Cython order event to convert.
+
+    Returns
+    -------
+    nautilus_pyo3 order event
+
+    """
+    Condition.not_none(event, "event")
+
+    pyo3_event_cls = getattr(nautilus_pyo3, type(event).__name__)
+    return pyo3_event_cls.from_dict(type(event).to_dict(event))
+
+
+cdef class OrderMatchingEngine(MatchingEngineBase):
     """
     Provides an order matching engine for a single market.
 
