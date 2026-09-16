@@ -38,6 +38,7 @@ from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import Venue
@@ -48,6 +49,8 @@ from nautilus_trader.test_kit.providers import TestDataProvider
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
+from nautilus_trader.trading.config import StrategyConfig
+from nautilus_trader.trading.strategy import Strategy
 
 
 AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
@@ -231,15 +234,73 @@ class TestRustMatchingEngineBacktest:
             orders = engine.cache.orders()
             assert orders
 
-            accepted = [e for o in orders for e in o.events if isinstance(e, OrderAccepted)]
             filled = [e for o in orders for e in o.events if isinstance(e, OrderFilled)]
-            assert accepted
             assert filled
             assert engine.cache.positions()
             assert not engine.trader.generate_order_fills_report().empty
             assert not engine.trader.generate_positions_report().empty
         finally:
             engine.dispose()
+
+    @pytest.mark.parametrize("matching_engine", ["cython", "rust"])
+    def test_resting_limit_order_is_accepted_then_filled(self, matching_engine):
+        # Arrange
+        engine = _build_engine(matching_engine=matching_engine)
+        strategy = RestingLimitStrategy(
+            config=StrategyConfig(strategy_id="S-001", order_id_tag="001"),
+        )
+        engine.add_strategy(strategy)
+
+        # Act
+        engine.run()
+
+        try:
+            # Assert
+            order = engine.cache.orders()[0]
+            event_types = [type(e).__name__ for e in order.events]
+            assert "OrderAccepted" in event_types
+            assert "OrderFilled" in event_types
+            assert event_types.index("OrderAccepted") < event_types.index("OrderFilled")
+            assert strategy.accepted == [order.client_order_id]
+            assert strategy.filled == [order.client_order_id]
+            assert engine.cache.positions()
+        finally:
+            engine.dispose()
+
+
+class RestingLimitStrategy(Strategy):
+    """
+    Submits a single resting BUY LIMIT order below the first quote, which is filled once
+    the market trades down through it.
+    """
+
+    def __init__(self, config: StrategyConfig) -> None:
+        super().__init__(config)
+        self.accepted: list = []
+        self.filled: list = []
+        self._submitted = False
+
+    def on_start(self) -> None:
+        self.subscribe_quote_ticks(AUDUSD_SIM.id)
+
+    def on_quote_tick(self, tick) -> None:
+        if self._submitted:
+            return
+
+        self._submitted = True
+        order = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=AUDUSD_SIM.make_qty(100_000),
+            price=AUDUSD_SIM.make_price(tick.bid_price.as_double() - 0.00005),
+        )
+        self.submit_order(order)
+
+    def on_event(self, event) -> None:
+        if isinstance(event, OrderAccepted):
+            self.accepted.append(event.client_order_id)
+        elif isinstance(event, OrderFilled):
+            self.filled.append(event.client_order_id)
 
     def test_cython_and_rust_engines_produce_equivalent_fills(self):
         # Arrange, Act

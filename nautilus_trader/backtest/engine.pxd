@@ -418,15 +418,18 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
     cdef object _pyo3_instrument
     cdef FillModel _fill_model
     cdef FeeModel _fee_model
+    cdef object _fill_adapter
+    cdef object _fee_adapter
     cdef bint _has_expiration_ns
     cdef uint64_t _expiration_ns
-    cdef dict _pyo3_orders
     cdef OrderBook _book
 
     cdef void _set_expiration_ns(self, Instrument instrument)
     cdef void _sync_top_of_book(self, uint64_t ts_event)
     cdef void _set_time(self)
     cdef void _drain_events(self)
+    cdef void _register_venue_order(self, ClientOrderId client_order_id)
+    cdef void _register_linked_orders(self, Order order)
     cdef object _order_to_pyo3(self, Order order)
     cdef object _command_to_pyo3(self, TradingCommand command)
     cdef list _orders_from_pyo3(self, list pyo3_orders)

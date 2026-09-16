@@ -331,7 +331,7 @@ impl Debug for PyOrderMatchingEngine {
 }
 
 impl PyOrderMatchingEngine {
-    fn cache_order(&self, order: &OrderAny) {
+    fn cache_order(&self, order: &OrderAny, position_id: Option<PositionId>) {
         let exists = self
             .cache
             .borrow()
@@ -352,7 +352,7 @@ impl PyOrderMatchingEngine {
         } else {
             self.cache
                 .borrow_mut()
-                .add_order(order.clone(), None, None, false)
+                .add_order(order.clone(), position_id, None, false)
         };
 
         if let Err(e) = result {
@@ -563,10 +563,18 @@ impl PyOrderMatchingEngine {
     ///
     /// Use this to pre-register linked contingent orders (OTO/OCO/OUO) before the order which
     /// references them is processed, mirroring how the trader cache holds all submitted orders.
-    #[pyo3(name = "add_order")]
-    fn py_add_order(&self, py: Python<'_>, order: Py<PyAny>) -> PyResult<()> {
+    ///
+    /// An optional `position_id` indexes the order against an existing position (HEDGING OMS),
+    /// mirroring the trader cache's client order ID to position ID index.
+    #[pyo3(name = "add_order", signature = (order, position_id=None))]
+    fn py_add_order(
+        &self,
+        py: Python<'_>,
+        order: Py<PyAny>,
+        position_id: Option<PositionId>,
+    ) -> PyResult<()> {
         let order = pyobject_to_order_any(py, order)?;
-        self.cache_order(&order);
+        self.cache_order(&order, position_id);
         Ok(())
     }
 
@@ -574,15 +582,19 @@ impl PyOrderMatchingEngine {
     ///
     /// If an order with the same client order ID is already cached and the incoming order
     /// carries more events, the cached copy is replaced.
-    #[pyo3(name = "process_order")]
+    ///
+    /// An optional `position_id` indexes the order against an existing position (HEDGING OMS),
+    /// mirroring the trader cache's client order ID to position ID index.
+    #[pyo3(name = "process_order", signature = (order, account_id, position_id=None))]
     fn py_process_order(
         &mut self,
         py: Python<'_>,
         order: Py<PyAny>,
         account_id: AccountId,
+        position_id: Option<PositionId>,
     ) -> PyResult<()> {
         let mut order = pyobject_to_order_any(py, order)?;
-        self.cache_order(&order);
+        self.cache_order(&order, position_id);
         self.engine.process_order(&mut order, account_id);
         Ok(())
     }

@@ -165,19 +165,28 @@ from nautilus_trader.model.data cimport compute_bar_quarter_sizes
 from nautilus_trader.model.events.order cimport OrderAccepted
 from nautilus_trader.model.events.order cimport OrderCanceled
 from nautilus_trader.model.events.order cimport OrderCancelRejected
+from nautilus_trader.model.events.order cimport OrderDenied
+from nautilus_trader.model.events.order cimport OrderEmulated
 from nautilus_trader.model.events.order cimport OrderEvent
 from nautilus_trader.model.events.order cimport OrderExpired
 from nautilus_trader.model.events.order cimport OrderFilled
+from nautilus_trader.model.events.order cimport OrderInitialized
 from nautilus_trader.model.events.order cimport OrderModifyRejected
+from nautilus_trader.model.events.order cimport OrderPendingCancel
+from nautilus_trader.model.events.order cimport OrderPendingUpdate
 from nautilus_trader.model.events.order cimport OrderRejected
+from nautilus_trader.model.events.order cimport OrderReleased
+from nautilus_trader.model.events.order cimport OrderSubmitted
 from nautilus_trader.model.events.order cimport OrderTriggered
 from nautilus_trader.model.events.order cimport OrderUpdated
 from nautilus_trader.model.functions cimport account_type_to_pyo3
 from nautilus_trader.model.functions cimport account_type_to_str
 from nautilus_trader.model.functions cimport aggressor_side_to_str
 from nautilus_trader.model.functions cimport book_type_to_str
+from nautilus_trader.model.functions cimport liquidity_side_from_str
 from nautilus_trader.model.functions cimport market_status_action_to_str
 from nautilus_trader.model.functions cimport oms_type_to_str
+from nautilus_trader.model.functions cimport order_side_to_str
 from nautilus_trader.model.functions cimport order_type_to_str
 from nautilus_trader.model.functions cimport time_in_force_to_str
 from nautilus_trader.model.identifiers cimport AccountId
@@ -4073,16 +4082,113 @@ cdef class MatchingEngineBase:
 
 # Maps pyo3 order event `type` strings to the legacy Cython event classes
 _ORDER_EVENT_CLASSES = {
+    "OrderInitialized": OrderInitialized,
+    "OrderDenied": OrderDenied,
+    "OrderEmulated": OrderEmulated,
+    "OrderReleased": OrderReleased,
+    "OrderSubmitted": OrderSubmitted,
     "OrderAccepted": OrderAccepted,
     "OrderRejected": OrderRejected,
     "OrderCanceled": OrderCanceled,
     "OrderExpired": OrderExpired,
     "OrderTriggered": OrderTriggered,
+    "OrderPendingUpdate": OrderPendingUpdate,
+    "OrderPendingCancel": OrderPendingCancel,
     "OrderUpdated": OrderUpdated,
     "OrderFilled": OrderFilled,
     "OrderModifyRejected": OrderModifyRejected,
     "OrderCancelRejected": OrderCancelRejected,
 }
+
+
+cdef Order _resolve_cython_order(CacheFacade cache, Instrument instrument, pyo3_order):
+    # Resolve the legacy Cython order corresponding to a pyo3 order and mirror
+    # the liquidity side the Rust engine assigned for this fill
+    cdef Order order = cache.order(ClientOrderId(pyo3_order.client_order_id.value))
+    if order is None:
+        raise RuntimeError(
+            f"Order {pyo3_order.client_order_id} not found in cache for {instrument.id}",
+        )
+
+    cdef LiquiditySide liquidity_side = liquidity_side_from_str(pyo3_order.liquidity_side.name)
+    if liquidity_side != LiquiditySide.NO_LIQUIDITY_SIDE:
+        order.liquidity_side = liquidity_side
+
+    return order
+
+
+class _FillModelAdapter:
+    """
+    Adapts a legacy Cython `FillModel` for the Rust matching engine.
+
+    The Rust engine calls `get_orderbook_for_fill_simulation` with pyo3 instrument
+    and order objects, so these are resolved back to their legacy Cython
+    equivalents before delegating, and any returned `OrderBook` is converted to
+    pyo3.
+
+    """
+
+    def __init__(self, fill_model: FillModel, instrument: Instrument, cache: CacheFacade) -> None:
+        self._fill_model = fill_model
+        self._instrument = instrument
+        self._cache = cache
+
+    @property
+    def fill_model(self) -> FillModel:
+        return self._fill_model
+
+    def is_limit_filled(self) -> bool:
+        return self._fill_model.is_limit_filled()
+
+    def is_slipped(self) -> bool:
+        return self._fill_model.is_slipped()
+
+    def fill_limit_inside_spread(self) -> bool:
+        return self._fill_model.fill_limit_inside_spread()
+
+    def get_orderbook_for_fill_simulation(self, pyo3_instrument, pyo3_order, pyo3_best_bid, pyo3_best_ask):
+        book = self._fill_model.get_orderbook_for_fill_simulation(
+            self._instrument,
+            _resolve_cython_order(self._cache, self._instrument, pyo3_order),
+            Price.from_raw_c(pyo3_best_bid.raw, pyo3_best_bid.precision),
+            Price.from_raw_c(pyo3_best_ask.raw, pyo3_best_ask.precision),
+        )
+        if book is None:
+            return None
+
+        return order_book_to_pyo3(book)
+
+
+class _FeeModelAdapter:
+    """
+    Adapts a legacy Cython `FeeModel` for the Rust matching engine.
+
+    The Rust engine calls `get_commission` with pyo3 order and instrument objects,
+    so these are converted back to their legacy Cython equivalents before
+    delegating, and the returned `Money` is converted to pyo3.
+
+    """
+
+    def __init__(self, fee_model: FeeModel, instrument: Instrument, cache: CacheFacade) -> None:
+        self._fee_model = fee_model
+        self._instrument = instrument
+        self._cache = cache
+
+    @property
+    def fee_model(self) -> FeeModel:
+        return self._fee_model
+
+    def get_commission(self, pyo3_order, pyo3_fill_qty, pyo3_fill_px, pyo3_instrument):
+        cdef Money commission = self._fee_model.get_commission(
+            _resolve_cython_order(self._cache, self._instrument, pyo3_order),
+            Quantity.from_raw_c(pyo3_fill_qty.raw, pyo3_fill_qty.precision),
+            Price.from_raw_c(pyo3_fill_px.raw, pyo3_fill_px.precision),
+            self._instrument,
+        )
+        return nautilus_pyo3.Money.from_raw(
+            commission._mem.raw,
+            nautilus_pyo3.Currency.from_str(commission.currency.code),
+        )
 
 
 cdef class RustOrderMatchingEngine(MatchingEngineBase):
@@ -4188,7 +4294,6 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
             instrument_id=instrument.id,
             book_type=book_type,
         )
-        self._pyo3_orders = {}
 
         self._config = nautilus_pyo3.OrderMatchingEngineConfig(
             bar_execution=bar_execution,
@@ -4204,14 +4309,18 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
             use_market_order_acks=use_market_order_acks,
             queue_position=queue_position,
             oto_full_trigger=oto_full_trigger,
-            price_protection_points=price_protection_points if price_protection_points is not None else 0,
+            # The legacy engine treats 0 points as disabled, whereas Rust treats
+            # `Some(0)` as an active zero-width protection band
+            price_protection_points=price_protection_points or None,
         )
         self._pyo3_instrument = instrument_to_pyo3(instrument)
+        self._fill_adapter = _FillModelAdapter(fill_model, instrument, cache)
+        self._fee_adapter = _FeeModelAdapter(fee_model, instrument, cache)
         self._engine = nautilus_pyo3.OrderMatchingEngine(
             instrument=self._pyo3_instrument,
             raw_id=raw_id,
-            fill_model=fill_model,
-            fee_model=fee_model,
+            fill_model=self._fill_adapter,
+            fee_model=self._fee_adapter,
             book_type=nautilus_pyo3.BookType(book_type_to_str(book_type)),
             oms_type=nautilus_pyo3.OmsType(oms_type_to_str(oms_type)),
             account_type=account_type_to_pyo3(account_type),
@@ -4253,8 +4362,40 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
             if event_type == "OrderFilled" and values.get("commission") is None:
                 values["commission"] = str(Money(0, self.instrument.quote_currency))
 
+            self._register_venue_order(ClientOrderId(values["client_order_id"]))
             event = event_cls.from_dict(values)
             self.msgbus.send(endpoint="ExecEngine.process", msg=event)
+
+    cdef void _register_venue_order(self, ClientOrderId client_order_id):
+        # Orders originated by the Rust engine itself (e.g. expiration closing
+        # legs) only exist in its private cache, so mirror them into the trader
+        # cache before their events reach the execution engine
+        if self.cache.order(client_order_id) is not None:
+            return
+
+        pyo3_order = self._engine.get_order(nautilus_pyo3.ClientOrderId(client_order_id.value))
+        if pyo3_order is None:
+            return
+
+        cdef Order order
+        if isinstance(pyo3_order, nautilus_pyo3.MarketOrder):
+            order = MarketOrder.from_pyo3(pyo3_order)
+        elif isinstance(pyo3_order, nautilus_pyo3.LimitOrder):
+            order = LimitOrder.from_pyo3(pyo3_order)
+        elif isinstance(pyo3_order, nautilus_pyo3.StopLimitOrder):
+            order = StopLimitOrder.from_pyo3(pyo3_order)
+        else:
+            self._log.warning(
+                f"Cannot mirror venue generated {type(pyo3_order).__name__} {client_order_id!r} "
+                "into the trader cache",
+            )
+            return
+
+        cdef PositionId position_id = None
+        if pyo3_order.position_id is not None:
+            position_id = PositionId(pyo3_order.position_id.value)
+
+        self.cache.add_order(order, position_id=position_id)
 
     cdef void _sync_top_of_book(self, uint64_t ts_event):
         # Mirror the Rust engines top-of-book into the Cython book after bar processing
@@ -4276,12 +4417,13 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         self._book.update_quote_tick(tick)
 
     cdef object _order_to_pyo3(self, Order order):
-        cdef object pyo3_order = self._pyo3_orders.get(order.client_order_id)
-        if pyo3_order is not None:
-            return pyo3_order
-
         pyo3_order_cls = getattr(nautilus_pyo3, type(order).__name__)
-        pyo3_order = pyo3_order_cls.from_dict(order.to_dict())
+        cdef dict values = order.to_dict()
+        cdef dict exec_algorithm_params = values.get("exec_algorithm_params")
+        if exec_algorithm_params is not None:
+            # pyo3 orders only carry string-valued exec algorithm params
+            values["exec_algorithm_params"] = {k: str(v) for k, v in exec_algorithm_params.items()}
+        pyo3_order = pyo3_order_cls.from_dict(values)
 
         # Replay the order's event history (after initialization) so the pyo3
         # order state (e.g. `SUBMITTED`) matches the legacy Cython order state.
@@ -4289,12 +4431,67 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         for event in events[1:]:
             pyo3_order.apply(order_event_to_pyo3(event))
 
-        self._pyo3_orders[order.client_order_id] = pyo3_order
         return pyo3_order
 
     cdef object _command_to_pyo3(self, TradingCommand command):
-        pyo3_command_cls = getattr(nautilus_pyo3, type(command).__name__)
-        return pyo3_command_cls.from_dict(type(command).to_dict(command))
+        # The pyo3 command constructors omit `params`, `correlation_id` and
+        # `causation_id`, which the matching engine does not use.
+        cdef object client_id = None
+        if command.client_id is not None:
+            client_id = nautilus_pyo3.ClientId(command.client_id.value)
+
+        trader_id = nautilus_pyo3.TraderId(command.trader_id.value)
+        strategy_id = nautilus_pyo3.StrategyId(command.strategy_id.value)
+        instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        command_id = nautilus_pyo3.UUID4.from_str(command.id.value)
+
+        if isinstance(command, ModifyOrder):
+            return nautilus_pyo3.ModifyOrder(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                nautilus_pyo3.ClientOrderId(command.client_order_id.value),
+                command_id,
+                command.ts_init,
+                venue_order_id=_venue_order_id_to_pyo3(command.venue_order_id),
+                quantity=_quantity_to_pyo3(command.quantity),
+                price=_price_to_pyo3(command.price),
+                trigger_price=_price_to_pyo3(command.trigger_price),
+                client_id=client_id,
+            )
+        elif isinstance(command, CancelOrder):
+            return nautilus_pyo3.CancelOrder(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                nautilus_pyo3.ClientOrderId(command.client_order_id.value),
+                command_id,
+                command.ts_init,
+                venue_order_id=_venue_order_id_to_pyo3(command.venue_order_id),
+                client_id=client_id,
+            )
+        elif isinstance(command, CancelAllOrders):
+            return nautilus_pyo3.CancelAllOrders(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                nautilus_pyo3.OrderSide(order_side_to_str(command.order_side)),
+                command_id,
+                command.ts_init,
+                client_id=client_id,
+            )
+        elif isinstance(command, BatchCancelOrders):
+            return nautilus_pyo3.BatchCancelOrders(
+                trader_id,
+                strategy_id,
+                instrument_id,
+                [self._command_to_pyo3(cancel) for cancel in command.cancels],
+                command_id,
+                command.ts_init,
+                client_id=client_id,
+            )
+
+        raise TypeError(f"Unsupported trading command type {type(command).__name__}")  # pragma: no cover
 
     cdef list _orders_from_pyo3(self, list pyo3_orders):
         cdef list orders = []
@@ -4318,7 +4515,6 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         self._engine.reset()
         self._engine.drain_events()
         self._book.reset()
-        self._pyo3_orders.clear()
         self._expiration_processed = False
 
         self._log.info(f"Reset {self.instrument.id}")
@@ -4336,7 +4532,8 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         Condition.not_none(fill_model, "fill_model")
 
         self._fill_model = fill_model
-        self._engine.set_fill_model(fill_model)
+        self._fill_adapter = _FillModelAdapter(fill_model, self.instrument, self.cache)
+        self._engine.set_fill_model(self._fill_adapter)
 
     cpdef void update_instrument(self, Instrument instrument):
         """
@@ -4355,6 +4552,8 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         self._instrument_has_expiration = instrument.instrument_class in ENGINE_EXPIRING_INSTRUMENT_CLASSES
         self._set_expiration_ns(instrument)
         self._pyo3_instrument = instrument_to_pyo3(instrument)
+        self._fill_adapter._instrument = instrument
+        self._fee_adapter._instrument = instrument
         self._set_time()
         self._engine.update_instrument(self._pyo3_instrument)
         self._drain_events()
@@ -4471,7 +4670,16 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
 
         self._book.apply_deltas(deltas)
         self._set_time()
-        self._engine.process_order_book_deltas(deltas.to_pyo3())
+        # Rebuild from fields rather than `deltas.to_pyo3()`, which clones the
+        # C FFI struct and carries interned identifiers from a foreign
+        # `Ustr` cache which never compare equal to the pyo3 book's own
+        cdef list pyo3_deltas = OrderBookDelta.to_pyo3_list(deltas.deltas)
+        self._engine.process_order_book_deltas(
+            nautilus_pyo3.OrderBookDeltas(
+                nautilus_pyo3.InstrumentId.from_str(deltas.instrument_id.value),
+                pyo3_deltas,
+            ),
+        )
         self._drain_events()
 
     cpdef void process_order_book_depth10(self, OrderBookDepth10 depth):
@@ -4613,9 +4821,36 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         Condition.not_none(order, "order")
         Condition.not_none(account_id, "account_id")
 
+        # Carry the position ID indexed by the execution engine (HEDGING OMS)
+        # so the Rust engines private cache resolves the same position
+        cdef PositionId position_id = self.cache.position_id(order.client_order_id)
+        cdef object pyo3_position_id = None
+        if position_id is not None:
+            pyo3_position_id = nautilus_pyo3.PositionId(position_id.value)
+
         self._set_time()
-        self._engine.process_order(self._order_to_pyo3(order), nautilus_pyo3.AccountId(account_id.value))
+        self._register_linked_orders(order)
+        self._engine.process_order(
+            self._order_to_pyo3(order),
+            nautilus_pyo3.AccountId(account_id.value),
+            pyo3_position_id,
+        )
         self._drain_events()
+
+    cdef void _register_linked_orders(self, Order order):
+        # Contingent orders are resolved from the Rust engines private cache,
+        # so pre-register any linked orders which are only in the trader cache
+        cdef list linked_order_ids = order.linked_order_ids
+        if not linked_order_ids:
+            return
+
+        cdef ClientOrderId client_order_id
+        cdef Order linked_order
+        for client_order_id in linked_order_ids:
+            linked_order = self.cache.order(client_order_id)
+            if linked_order is None:
+                continue
+            self._engine.add_order(self._order_to_pyo3(linked_order))
 
     cpdef void process_modify(self, ModifyOrder command, AccountId account_id):
         """
@@ -4715,16 +4950,59 @@ cdef class RustOrderMatchingEngine(MatchingEngineBase):
         if self._has_expiration_ns and not self._expiration_processed and timestamp_ns >= self._expiration_ns:
             self._expiration_processed = True
 
-        # Purge cached pyo3 orders for closed orders
-        cdef Order order
-        cdef list closed = []
-        for client_order_id in self._pyo3_orders:
-            order = self.cache.order(client_order_id)
-            if order is not None and order.is_closed_c():
-                closed.append(client_order_id)
 
-        for client_order_id in closed:
-            self._pyo3_orders.pop(client_order_id, None)
+cdef object _price_to_pyo3(Price price):
+    if price is None:
+        return None
+
+    return nautilus_pyo3.Price.from_raw(price._mem.raw, price._mem.precision)
+
+
+cdef object _quantity_to_pyo3(Quantity quantity):
+    if quantity is None:
+        return None
+
+    return nautilus_pyo3.Quantity.from_raw(quantity._mem.raw, quantity._mem.precision)
+
+
+cdef object _venue_order_id_to_pyo3(VenueOrderId venue_order_id):
+    if venue_order_id is None:
+        return None
+
+    return nautilus_pyo3.VenueOrderId(venue_order_id.value)
+
+
+cpdef object order_book_to_pyo3(OrderBook book):
+    """
+    Return a pyo3 order book converted from the given legacy Cython order book.
+
+    Parameters
+    ----------
+    book : OrderBook
+        The legacy Cython order book to convert.
+
+    Returns
+    -------
+    nautilus_pyo3.OrderBook
+
+    """
+    Condition.not_none(book, "book")
+
+    pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(book.instrument_id.value)
+    pyo3_book = nautilus_pyo3.OrderBook(
+        pyo3_instrument_id,
+        nautilus_pyo3.BookType(book_type_to_str(book.book_type)),
+    )
+    cdef OrderBookDeltas deltas = book.to_deltas_c(book.ts_event, book.ts_init)
+    if deltas.deltas:
+        pyo3_book.apply_deltas(
+            nautilus_pyo3.OrderBookDeltas(
+                pyo3_instrument_id,
+                OrderBookDelta.to_pyo3_list(deltas.deltas),
+            ),
+        )
+
+    return pyo3_book
 
 
 cpdef object instrument_to_pyo3(Instrument instrument):
