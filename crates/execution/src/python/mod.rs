@@ -19,6 +19,7 @@ pub mod config;
 pub mod fee;
 pub mod fill;
 pub mod latency;
+pub mod matching_engine;
 pub mod reconciliation;
 
 use pyo3::prelude::*;
@@ -68,5 +69,7 @@ pub fn execution(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::models::fill::VolumeSensitiveFillModel>()?;
     m.add_class::<crate::models::fill::MarketHoursFillModel>()?;
     m.add_class::<crate::models::latency::StaticLatencyModel>()?;
+    m.add_class::<crate::matching_engine::config::OrderMatchingEngineConfig>()?;
+    m.add_class::<matching_engine::PyOrderMatchingEngine>()?;
     Ok(())
 }
