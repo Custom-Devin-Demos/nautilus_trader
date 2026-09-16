@@ -129,3 +129,22 @@ Deterministic trade IDs have these properties:
 
 The `use_random_ids` venue flag still governs `VenueOrderId` and `PositionId` generation, but
 `TradeId` is always deterministic and is not affected by the flag.
+
+## Matching-engine parity harness
+
+`scripts/backtest_parity.py` (or `make backtest-parity`) runs each offline example under
+`examples/backtest/` twice as a subprocess, selecting the matching engine through the
+`NAUTILUS_BACKTEST_MATCHING_ENGINE` environment variable (`cython` or `rust`), and diffs the
+captured fill sequence, orders/positions reports and final portfolio state (account balances,
+net positions, realized/unrealized PnL). Examples that need network access or external data files
+are skipped with a reason.
+
+```bash
+make backtest-parity                                   # cython vs rust
+make backtest-parity PARITY_ENGINES="cython cython"    # determinism baseline
+python scripts/backtest_parity.py --only fx_ema_cross_audusd_ticks --keep-artifacts --markdown parity.md
+```
+
+The harness sets `PYTHONHASHSEED=0` and pins unseeded `random.seed()` calls (used by `FillModel`
+without a `random_seed`) so example runs are reproducible. It exits non-zero on any divergence,
+and refuses to run the `rust` selection when `BacktestVenueConfig` has no `matching_engine` field.

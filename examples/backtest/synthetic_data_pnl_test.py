@@ -78,8 +78,8 @@ class MinimalStrategy(Strategy):
         super().__init__(config)
         self.bars_processed = -1
 
-        self.portfolio_realized_pnl_values[int, Money] = {}
-        self.portfolio_unrealized_pnl_values[int, Money] = {}
+        self.portfolio_realized_pnl_values: dict[int, Money] = {}
+        self.portfolio_unrealized_pnl_values: dict[int, Money] = {}
 
     def on_start(self):
         self.subscribe_bars(self.config.bar_type)
