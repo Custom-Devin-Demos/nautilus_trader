@@ -1218,6 +1218,10 @@ pytest-doctest:  #-- Build v1 and run its supported Python doctests
 test-performance:  #-- Run performance tests with codspeed benchmarking
 	uv run --active --no-sync pytest tests/performance_tests --benchmark-disable-gc --codspeed
 
+.PHONY: backtest-parity
+backtest-parity:  #-- Run examples/backtest with two matching engines (PARITY_ENGINES="cython rust") and diff results
+	uv run --active --no-sync python scripts/backtest_parity.py --engines $(or $(PARITY_ENGINES),cython rust) $(PARITY_ARGS)
+
 #== v2 (python/)
 # Unset VIRTUAL_ENV so uv targets the python/.venv, not the parent v1 venv.
 
