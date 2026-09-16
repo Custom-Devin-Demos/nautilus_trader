@@ -29,6 +29,7 @@ pub mod cache;
 pub mod clock;
 pub mod custom;
 pub mod enums;
+pub mod execution;
 pub mod fifo;
 pub mod greeks;
 pub mod indicators;
@@ -77,6 +78,10 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::python::logging::PyLogger>()?;
     m.add_class::<crate::actor::data_actor::DataActorConfig>()?;
     m.add_class::<crate::actor::data_actor::ImportableActorConfig>()?;
+    m.add_class::<crate::messages::execution::ModifyOrder>()?;
+    m.add_class::<crate::messages::execution::CancelOrder>()?;
+    m.add_class::<crate::messages::execution::CancelAllOrders>()?;
+    m.add_class::<crate::messages::execution::BatchCancelOrders>()?;
     m.add_class::<crate::msgbus::BusMessage>()?;
     m.add_class::<crate::msgbus::config::MessageBusConfig>()?;
     m.add_class::<crate::python::msgbus::PyMessageBus>()?;
