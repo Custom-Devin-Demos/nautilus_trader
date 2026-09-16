@@ -238,6 +238,8 @@ cdef class SimulatedExchange:
     """If the account for the exchange is frozen.\n\n:returns: `bool`"""
     cdef readonly LatencyModel latency_model
     """The latency model for the exchange.\n\n:returns: `LatencyModel`"""
+    cdef readonly str matching_engine
+    """The matching engine implementation for the exchange ('cython' or 'rust').\n\n:returns: `str`"""
     cdef readonly FillModel fill_model
     """The fill model for the exchange.\n\n:returns: `FillModel`"""
     cdef readonly FeeModel fee_model
@@ -279,7 +281,7 @@ cdef class SimulatedExchange:
     cdef dict[InstrumentId, float] settlement_prices
     """Optional instrument_id -> settlement price for instrument expiration."""
 
-    cdef dict[InstrumentId, OrderMatchingEngine] _matching_engines
+    cdef dict[InstrumentId, MatchingEngineBase] _matching_engines
     cdef bint _has_next_instrument_expiration
     cdef uint64_t _next_instrument_expiration_ns
     cdef object _message_queue
@@ -299,8 +301,8 @@ cdef class SimulatedExchange:
     cpdef Price best_bid_price(self, InstrumentId instrument_id)
     cpdef Price best_ask_price(self, InstrumentId instrument_id)
     cpdef OrderBook get_book(self, InstrumentId instrument_id)
-    cpdef OrderMatchingEngine get_matching_engine(self, InstrumentId instrument_id)
-    cpdef dict[InstrumentId, OrderMatchingEngine] get_matching_engines(self)
+    cpdef MatchingEngineBase get_matching_engine(self, InstrumentId instrument_id)
+    cpdef dict[InstrumentId, MatchingEngineBase] get_matching_engines(self)
     cpdef dict[InstrumentId, OrderBook] get_books(self)
     cpdef list[Order] get_open_orders(self, InstrumentId instrument_id=*)
     cpdef list[Order] get_open_bid_orders(self, InstrumentId instrument_id=*)
@@ -328,8 +330,8 @@ cdef class SimulatedExchange:
     cpdef void _process_instrument_expiration_time_event(self, TimeEvent event)
 
     cdef void _process_instrument_expirations(self, uint64_t ts_now)
-    cdef void _update_next_instrument_expiration(self, OrderMatchingEngine matching_engine)
-    cdef void _set_instrument_expiration_timer(self, OrderMatchingEngine matching_engine)
+    cdef void _update_next_instrument_expiration(self, MatchingEngineBase matching_engine)
+    cdef void _set_instrument_expiration_timer(self, MatchingEngineBase matching_engine)
     cdef void _set_instrument_expiration_timers(self)
     cdef str _instrument_expiration_timer_name(self, Venue venue, uint64_t expiration_ns)
 
@@ -359,16 +361,85 @@ cdef class SimulatedExchange:
     cdef void _generate_fresh_account_state(self)
 
 
-cdef class OrderMatchingEngine:
+cdef class MatchingEngineBase:
     cdef Clock _clock
     cdef Logger _log
     cdef MessageBus _msgbus
+    cdef bint _instrument_has_expiration
+    cdef bint _expiration_processed
+
+    cdef readonly Venue venue
+    """The venue for the matching engine.\n\n:returns: `Venue`"""
+    cdef readonly Instrument instrument
+    """The instrument for the matching engine.\n\n:returns: `Instrument`"""
+    cdef readonly uint32_t raw_id
+    """The instruments raw integer ID for the exchange.\n\n:returns: `int`"""
+    cdef readonly BookType book_type
+    """The order book type for the matching engine.\n\n:returns: `BookType`"""
+    cdef readonly OmsType oms_type
+    """The order management system type for the matching engine.\n\n:returns: `OmsType`"""
+    cdef readonly AccountType account_type
+    """The account type for the matching engine.\n\n:returns: `AccountType`"""
+    cdef readonly CacheFacade cache
+    """The cache for the matching engine.\n\n:returns: `CacheFacade`"""
+    cdef readonly MessageBus msgbus
+    """The message bus for the matching engine.\n\n:returns: `MessageBus`"""
+
+    cpdef void reset(self)
+    cpdef void set_fill_model(self, FillModel fill_model)
+    cpdef void update_instrument(self, Instrument instrument)
+    cpdef Price best_bid_price(self)
+    cpdef Price best_ask_price(self)
+    cpdef OrderBook get_book(self)
+    cpdef list[Order] get_open_orders(self)
+    cpdef list[Order] get_open_bid_orders(self)
+    cpdef list[Order] get_open_ask_orders(self)
+    cpdef bint order_exists(self, ClientOrderId client_order_id)
+    cpdef void process_order_book_delta(self, OrderBookDelta delta)
+    cpdef void process_order_book_deltas(self, OrderBookDeltas deltas)
+    cpdef void process_order_book_depth10(self, OrderBookDepth10 depth)
+    cpdef void process_quote_tick(self, QuoteTick tick)
+    cpdef void process_trade_tick(self, TradeTick tick)
+    cpdef void process_bar(self, Bar bar)
+    cpdef void process_status(self, MarketStatusAction status)
+    cpdef void process_instrument_close(self, InstrumentClose close)
+    cpdef void check_instrument_expiration(self, uint64_t timestamp_ns)
+    cpdef void process_order(self, Order order, AccountId account_id)
+    cpdef void process_modify(self, ModifyOrder command, AccountId account_id)
+    cpdef void process_cancel(self, CancelOrder command, AccountId account_id)
+    cpdef void process_cancel_all(self, CancelAllOrders command, AccountId account_id)
+    cpdef void process_batch_cancel(self, BatchCancelOrders command, AccountId account_id)
+    cpdef void iterate(self, uint64_t timestamp_ns, AggressorSide aggressor_side=*)
+
+
+cdef class RustOrderMatchingEngine(MatchingEngineBase):
+    cdef object _engine
+    cdef object _config
+    cdef object _pyo3_instrument
+    cdef FillModel _fill_model
+    cdef FeeModel _fee_model
+    cdef object _fill_adapter
+    cdef object _fee_adapter
+    cdef bint _has_expiration_ns
+    cdef uint64_t _expiration_ns
+    cdef OrderBook _book
+
+    cdef void _set_expiration_ns(self, Instrument instrument)
+    cdef void _sync_top_of_book(self, uint64_t ts_event)
+    cdef void _set_time(self)
+    cdef void _drain_events(self)
+    cdef void _register_venue_order(self, ClientOrderId client_order_id)
+    cdef void _register_linked_orders(self, Order order)
+    cdef object _order_to_pyo3(self, Order order)
+    cdef object _command_to_pyo3(self, TradingCommand command)
+    cdef list _orders_from_pyo3(self, list pyo3_orders)
+
+
+cdef class OrderMatchingEngine(MatchingEngineBase):
     cdef OrderBook _book
     cdef FillModel _fill_model
     cdef FeeModel _fee_model
     cdef InstrumentClose _instrument_close
-    cdef bint _instrument_has_expiration
-    cdef bint _expiration_processed
     cdef bint _reject_stop_orders
     cdef bint _support_gtd_orders
     cdef bint _support_contingent_orders
@@ -389,24 +460,8 @@ cdef class OrderMatchingEngine:
     cdef dict[BarType, object] _execution_bar_deltas
     cdef dict[ClientOrderId, Quantity] _cached_filled_qty
 
-    cdef readonly Venue venue
-    """The venue for the matching engine.\n\n:returns: `Venue`"""
-    cdef readonly Instrument instrument
-    """The instrument for the matching engine.\n\n:returns: `Instrument`"""
-    cdef readonly uint32_t raw_id
-    """The instruments raw integer ID for the exchange.\n\n:returns: `int`"""
-    cdef readonly BookType book_type
-    """The order book type for the matching engine.\n\n:returns: `BookType`"""
-    cdef readonly OmsType oms_type
-    """The order management system type for the matching engine.\n\n:returns: `OmsType`"""
-    cdef readonly AccountType account_type
-    """The account type for the matching engine.\n\n:returns: `AccountType`"""
     cdef readonly MarketStatus market_status
     """The market status for the matching engine.\n\n:returns: `MarketStatus`"""
-    cdef readonly CacheFacade cache
-    """The cache for the matching engine.\n\n:returns: `CacheFacade`"""
-    cdef readonly MessageBus msgbus
-    """The message bus for the matching engine.\n\n:returns: `MessageBus`"""
 
     cdef MatchingCore _core
     cdef uint8_t _price_prec
@@ -438,31 +493,8 @@ cdef class OrderMatchingEngine:
     cdef int _order_count
     cdef int _execution_count
 
-    cpdef void reset(self)
-    cpdef void set_fill_model(self, FillModel fill_model)
-    cpdef void update_instrument(self, Instrument instrument)
-
-# -- QUERIES --------------------------------------------------------------------------------------
-
-    cpdef Price best_bid_price(self)
-    cpdef Price best_ask_price(self)
-    cpdef OrderBook get_book(self)
-    cpdef list[Order] get_open_orders(self)
-    cpdef list[Order] get_open_bid_orders(self)
-    cpdef list[Order] get_open_ask_orders(self)
-    cpdef bint order_exists(self, ClientOrderId client_order_id)
-
 # -- DATA PROCESSING ------------------------------------------------------------------------------
 
-    cpdef void process_order_book_delta(self, OrderBookDelta delta)
-    cpdef void process_order_book_deltas(self, OrderBookDeltas deltas)
-    cpdef void process_order_book_depth10(self, OrderBookDepth10 depth)
-    cpdef void process_quote_tick(self, QuoteTick tick)
-    cpdef void process_trade_tick(self, TradeTick tick)
-    cpdef void process_bar(self, Bar bar)
-    cpdef void process_status(self, MarketStatusAction status)
-    cpdef void process_instrument_close(self, InstrumentClose close)
-    cpdef void check_instrument_expiration(self, uint64_t timestamp_ns)
     cdef void _process_option_expiry(self, uint64_t ts_now)
     cdef Instrument _get_option_underlying_instrument(self)
     cdef bint _option_should_exercise(self, Price underlying_price)
@@ -490,11 +522,6 @@ cdef class OrderMatchingEngine:
 
 # -- TRADING COMMANDS -----------------------------------------------------------------------------
 
-    cpdef void process_order(self, Order order, AccountId account_id)
-    cpdef void process_modify(self, ModifyOrder command, AccountId account_id)
-    cpdef void process_cancel(self, CancelOrder command, AccountId account_id)
-    cpdef void process_cancel_all(self, CancelAllOrders command, AccountId account_id)
-    cpdef void process_batch_cancel(self, BatchCancelOrders command, AccountId account_id)
     cdef bint _convert_quote_to_base_quantity(self, Order order)
     cdef void _process_market_order(self, MarketOrder order)
     cdef void _process_market_to_limit_order(self, MarketToLimitOrder order)
@@ -517,7 +544,6 @@ cdef class OrderMatchingEngine:
 
 # -- ORDER PROCESSING -----------------------------------------------------------------------------
 
-    cpdef void iterate(self, uint64_t timestamp_ns, AggressorSide aggressor_side=*)
     cdef void _purge_closed_cached_filled_qty(self)
     cpdef list[tuple[Price, Quantity]] determine_limit_price_and_volume(self, Order order)
     cpdef list[tuple[Price, Quantity]] determine_market_price_and_volume(self, Order order)

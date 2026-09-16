@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 from typing import Any
+from typing import Literal
 
 import msgspec
 import pandas as pd
@@ -138,6 +139,11 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
         For options, the option leg settles at this price.
     liquidation_enabled : bool, default False
         If liquidation of positions should be triggered when maintenance margin is breached.
+    matching_engine : Literal["cython", "rust"], optional
+        The order matching engine implementation to use for this venue.
+        If "rust" then the PyO3 `OrderMatchingEngine` is driven through a Cython bridge.
+        When not set explicitly, the `NAUTILUS_BACKTEST_MATCHING_ENGINE` env var is honoured
+        by `BacktestEngine.add_venue` as a fallback default, otherwise "cython".
     liquidation_trigger_ratio : float, default 1.0
         Ratio of equity to maintenance margin at which liquidation is triggered
         (default 1.0 means equity <= maintenance_margin).
@@ -190,6 +196,21 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
     """
     If open orders should be cancelled before closing positions during liquidation.
     """
+    matching_engine: Literal["cython", "rust"] | None = None
+    """
+    The order matching engine implementation ("cython" or "rust").
+
+    If ``None`` then the `NAUTILUS_BACKTEST_MATCHING_ENGINE` env var is used, falling back
+    to "cython".
+
+    """
+
+    def __post_init__(self) -> None:
+        if self.matching_engine is not None and self.matching_engine not in ("cython", "rust"):
+            raise ValueError(
+                f"Invalid `matching_engine` '{self.matching_engine}', "
+                "was not one of ('cython', 'rust')",
+            )
 
 
 class BacktestDataConfig(NautilusConfig, frozen=True):

@@ -417,6 +417,7 @@ class BacktestNode:
                 allow_cash_borrowing=venue_config.allow_cash_borrowing,
                 price_protection_points=get_price_protection_points(venue_config),
                 settlement_prices=venue_config.settlement_prices,
+                matching_engine=venue_config.matching_engine,
             )
 
         # Add instruments
